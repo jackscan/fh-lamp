@@ -32,23 +32,17 @@
 #include <avr/wdt.h>
 #include <avr/power.h>
 #include <avr/interrupt.h>
+#include <avr/sleep.h>
 #include <string.h>
 #include <stdio.h>
 
 #include "Descriptors.h"
+#include "Pixel.h"
+#include "Timer.h"
+#include "Util.h"
 
 #include <LUFA/Drivers/USB/USB.h>
 #include <LUFA/Platform/Platform.h>
-
-#define PIXEL_PORT PORTD
-#define PIXEL_DDR DDRD
-#define PIXEL_BIT (1 << PD0)
-#define NUM_PIXELS 12
-#define BYTES_PER_PIXEL 4
-#define F_PIXEL 800000
-#define PIXEL_PWR_PORT PORTB
-#define PIXEL_PWR_DDR DDRB
-#define PIXEL_PWR_BIT (1 << PB6)
 
 #define LED1_DDR DDRB
 #define LED1_PORT PORTB
@@ -78,81 +72,39 @@
  *  passed to all CDC Class driver functions, so that multiple instances of the same class
  *  within a device can be differentiated from one another.
  */
-USB_ClassInfo_CDC_Device_t VirtualSerial_CDC_Interface =
-	{
-		.Config =
-			{
-				.ControlInterfaceNumber   = INTERFACE_ID_CDC_CCI,
-				.DataINEndpoint           =
-					{
-						.Address          = CDC_TX_EPADDR,
-						.Size             = CDC_TXRX_EPSIZE,
-						.Banks            = 1,
-					},
-				.DataOUTEndpoint =
-					{
-						.Address          = CDC_RX_EPADDR,
-						.Size             = CDC_TXRX_EPSIZE,
-						.Banks            = 1,
-					},
-				.NotificationEndpoint =
-					{
-						.Address          = CDC_NOTIFICATION_EPADDR,
-						.Size             = CDC_NOTIFICATION_EPSIZE,
-						.Banks            = 1,
-					},
-			},
-	};
-
-/** Counter for the software PWM. */
-static volatile uint8_t SoftPWM_Count;
-
-/** Duty cycle for the first software PWM channel. */
-static volatile uint8_t SoftPWM_Channel1_Duty;
-
-/** Duty cycle for the second software PWM channel. */
-static volatile uint8_t SoftPWM_Channel2_Duty;
-
-/** Duty cycle for the third software PWM channel. */
-static volatile uint8_t SoftPWM_Channel3_Duty;
+USB_ClassInfo_CDC_Device_t VirtualSerial_CDC_Interface = {
+	.Config =
+		{
+			.ControlInterfaceNumber = INTERFACE_ID_CDC_CCI,
+			.DataINEndpoint =
+				{
+					.Address = CDC_TX_EPADDR,
+					.Size    = CDC_TXRX_EPSIZE,
+					.Banks   = 1,
+				},
+			.DataOUTEndpoint =
+				{
+					.Address = CDC_RX_EPADDR,
+					.Size    = CDC_TXRX_EPSIZE,
+					.Banks   = 1,
+				},
+			.NotificationEndpoint =
+				{
+					.Address = CDC_NOTIFICATION_EPADDR,
+					.Size    = CDC_NOTIFICATION_EPSIZE,
+					.Banks   = 1,
+				},
+		},
+};
 
 /** Standard file stream for the CDC interface when set up, so that the virtual CDC COM port can be
  *  used like any regular character stream in the C APIs.
  */
 static FILE USBSerialStream;
 
-
-/** Interrupt handler for managing the software PWM channels for the LEDs */
-// ISR(TIMER0_COMPA_vect, ISR_BLOCK)
-// {
-// 	uint8_t LEDMask = LEDS_ALL_LEDS;
-
-// 	if (++SoftPWM_Count == 0b00011111)
-// 	  SoftPWM_Count = 0;
-
-// 	if (SoftPWM_Count >= SoftPWM_Channel1_Duty)
-// 	  LEDMask &= ~LEDS_LED1;
-
-// 	if (SoftPWM_Count >= SoftPWM_Channel2_Duty)
-// 	  LEDMask &= ~LEDS_LED2;
-
-// 	if (SoftPWM_Count >= SoftPWM_Channel3_Duty)
-// 	  LEDMask &= ~LEDS_LED3;
-
-// 	LEDs_SetAllLEDs(LEDMask);
-// }
-
-
-// enum
-// {
-// 	ROT1 = 0x1,
-// 	ROT2 = 0x2,
-// 	BTN = 0x4,
-// };
-
 static struct
 {
-	volatile uint8_t rotation;
+	volatile int8_t rotation;
 	volatile bool pressed;
 	uint8_t rotstate;
 	int8_t dir;
@@ -188,23 +140,13 @@ ISR(PCINT0_vect)
 
 	if (rotstate == (ROT1_BIT | ROT2_BIT) && RotButton.dir != 0)
 	{
-		int8_t rot = (int8_t)RotButton.rotation + (RotButton.dir > 0 ? 1 : -1);
-		if (rot < 0) rot = ROT_STEPS - 1;
-		else if (rot >= ROT_STEPS) rot = 0;
-		RotButton.rotation = rot;
+		RotButton.rotation += (RotButton.dir > 0 ? 1 : -1);
 		RotButton.dir = 0;
 	}
 	PORTD &= ~(1 << PD7);
 }
 
-static struct
-{
-	uint8_t data[NUM_PIXELS * BYTES_PER_PIXEL];
-	uint8_t luminance;
-	bool on;
-} pixel;
-
-// on Pro Micro board: LEDs or on when port is low
+// on Pro Micro board: LEDs are on when port is low
 static inline void led1_on(void)
 {
 	LED1_PORT &= ~LED1_BIT;
@@ -237,9 +179,7 @@ static void SetupHardware(void)
 
 	/* Hardware Initialization */
 
-	// set power pin high output to close mosfet
-	PIXEL_PWR_PORT |= PIXEL_PWR_BIT;
-	PIXEL_PWR_DDR |= PIXEL_PWR_BIT;
+	Pixel_Setup();
 
 	// configure button pin
 	// set as input
@@ -260,20 +200,7 @@ static void SetupHardware(void)
 	PCMSK0 |= ROT_PCMSK;
 	PCICR |= (1 << PCIE0);
 
-	// LEDs_Init();
 	USB_Init();
-
-	// running timer 0 for on a 800kHz interval
-	// clear OC0B on compare match
-	// fast pwm with OCR0A as top
-	OCR0A  = F_CPU / F_PIXEL - 1;
-	OCR0B = 0;
-	TCNT0 = 0;
-	TCCR0A = (1 << COM0B1) | (1 << WGM01) | (1 << WGM00);
-	TCCR0B = (1 << WGM02);
-
-	// PIXEL_PORT &= ~(PIXEL_BIT);
-	PIXEL_DDR |= PIXEL_BIT;
 
 	// onboard LEDs
 	led1_off();
@@ -281,151 +208,173 @@ static void SetupHardware(void)
 	LED1_DDR |= LED1_BIT;
 	LED2_DDR |= LED2_BIT;
 
-	// // for debugging
-	// DDRD |= (1 << PD7);
-	// PORTD &= ~(1 << PD7);
+	StartTimer();
+
+	// Power reduction
+	PRR0 = (1 << PRTWI) | (1 << PRSPI) | (1 << PRADC);
+	PRR1 = (1 << PRUSART1);
 }
 
-static void writePixels(void)
+// static void processCmd(const char *buf)
+// {
+// 	fprintf(&USBSerialStream, "\nprocessing: %s\n", buf);
+// 	fflush(&USBSerialStream);
+
+// 	unsigned num, r, g, b, w;
+// 	if (sscanf(buf, "%u %u %u %u %u", &num, &r, &g, &b, &w) == 5)
+// 	{
+// 		setPixel(num, r, g, b, w);
+// 		writePixels();
+// 	}
+// 	else if (sscanf(buf, "a %u %u %u %u", &r, &g, &b, &w) == 4)
+// 	{
+// 		for (uint8_t i = 0; i < NUM_PIXELS; ++i)
+// 			setPixel(i, r, g, b, w);
+// 		writePixels();
+// 	}
+// 	else
+// 	{
+// 		fprintf(&USBSerialStream, "invalid command\n");
+// 		fflush(&USBSerialStream);
+// 	}
+// }
+
+static uint8_t updateLuminance(uint8_t rot)
 {
-	CDC_Device_Flush(&VirtualSerial_CDC_Interface);
-	GlobalInterruptDisable();
+	const uint8_t step = 25;
+	const uint8_t max = NUM_LUMINANCE_STEPS / step;
+	LOCKI();
+	if (RotButton.rotation >= max) RotButton.rotation = max - 1;
+	else if (RotButton.rotation < 0) RotButton.rotation = 0;
+	uint8_t newrot = RotButton.rotation;
+	UNLOCKI();
 
-	const uint8_t zero = F_CPU / (F_PIXEL * 4) - 1;
-	const uint8_t one = F_CPU / (F_PIXEL * 2) - 1;
-
-	GCC_MEMORY_BARRIER();
-
-	uint8_t *p = pixel.data;
-	uint8_t c = *p;
-	// set up timer
-	// set OCR0B for first cycle
-	OCR0B = (c & 0x80) != 0 ? one : zero;
-	TCNT0 = 0;
-	TIFR0 = (1 << TOV0);
-	TCCR0B |= (1 << CS00);
-
-	// byte counter
-	uint8_t i = NUM_PIXELS * BYTES_PER_PIXEL;
-	// bit counter
-	uint8_t b = 7;
-	c <<= 1;
-	// loop over bytes
-	while (true)
+	if (rot != newrot)
 	{
-		// loop over bits
-		while (true)
-		{
-			// prepare for next cycle
-			uint8_t ocr0b = (c & 0x80) != 0 ? one : zero;
-			// wait for previous cycle to finish
-			while ((TIFR0 & (1 << TOV0)) == 0)
-				;
-			OCR0B = ocr0b;
-			// reset overflow flag
-			TIFR0 = (1 << TOV0);
+		fprintf(&USBSerialStream, "s: %#x\n", newrot);
+		fflush(&USBSerialStream);
+		CDC_Device_Flush(&VirtualSerial_CDC_Interface);
+		Pixel_SetLuminance(newrot * step);
+	}
+	return newrot;
+}
 
-			if (--b == 0) break;
-			c <<= 1;
+// static void animateLuminance(void)
+// {
+// 	static const uint8_t l[16] = {
+// 		0, 9, 8, 7, 6, 9, 8, 6, 2, 0, 8, 7, 6, 1, 0, 5,
+// 	};
+// 	uint16_t t = GetTime();
+// 	uint8_t i = t / 128;
+// 	uint8_t r = t % 128;
+// 	uint16_t a = l[i % 16] * 25;
+// 	uint16_t b = l[(i + 1) % 16]*25;
+// 	uint8_t c = (uint8_t)((a * (128 - r) + b * r) / 128);
+// 	Pixel_SetLuminance(c);
+// }
+
+static uint8_t rnd(void)
+{
+	static uint8_t s = 0xaa, a = 0;
+	s ^= s << 3;
+	s ^= s >> 5;
+	s ^= a++ >> 2;
+	return s;
+}
+
+static void animateLuminance(void)
+{
+	static uint16_t last = 0;
+	static uint8_t acc = 0;
+	static uint8_t interval = 0;
+	uint16_t t = GetTime();
+	uint16_t dt = (t - last) / 4;
+
+	if (dt > interval)
+	{
+		last = t;
+		// interval = rnd() / 2 + 16;
+		// uint8_t b = rnd() / 16;
+		// if ((uint16_t)acc + (uint16_t)b < 256)
+		// 	acc += b;
+		// else
+		// 	acc = 255;
+		interval = rnd() / 4 + 16;
+		uint8_t b = rnd();
+		if (dt + b > (uint16_t)acc)
+			acc = b;
+		else
+			acc -= dt;
+		dt = 0;
+	};
+	uint8_t l = acc > dt ? acc - dt : 0;
+	Pixel_SetLuminance(l);
+}
+
+static uint8_t rotateLight(uint8_t rot)
+{
+	const uint8_t max = NUM_PIXELS;
+	LOCKI();
+	if (RotButton.rotation >= max) RotButton.rotation = 0;
+	else if (RotButton.rotation < 0) RotButton.rotation = max - 1;
+	uint8_t newrot = RotButton.rotation;
+	UNLOCKI();
+
+	if (newrot != rot)
+	{
+		rot = newrot;
+		Pixel_Clear();
+		Pixel_Set(newrot, 255, 255, 255);
+		Pixel_Write();
+	}
+	return newrot;
+}
+
+static uint8_t hue2rgb(uint16_t p, uint16_t q, int16_t t)
+{
+	if (t < 0) t += 255;
+	if (t > 255) t -= 255;
+	if (t < 255 / 6) return p + ((q - p) * 6 * t + 128) / 255;
+	if (t < 255 / 2) return q;
+	if (t < 255 * 2 / 3)
+		return p + ((q - p) * (255 * 2 / 3 - t) * 6 + 128) / 255;
+	return p;
+}
+
+static void processHSL(const char *buf)
+{
+	uint16_t h, s, l;
+	if (sscanf(buf, "%u %u %u", &h, &s, &l) == 3 &&
+	    h < 256 && s < 256 && l < 256)
+	{
+		// Pixel_SetHSL(h, s, l);
+		// Pixel_Write();
+
+		uint8_t r, g, b;
+		if (s == 0)
+		{
+			r = g = b = l; // achromatic
+		}
+		else
+		{
+			uint16_t q = l < 128 ? (l * (255 + s) + 128) / 255
+								: l + s - (l * s + 128) / 255;
+			uint16_t p = 2 * l - q;
+			r          = (hue2rgb(p, q, h + 255 / 3));
+			g          = (hue2rgb(p, q, h));
+			b          = (hue2rgb(p, q, h - 255 / 3));
 		}
 
-		if (--i == 0) break;
-		b = 8;
-		c = *(++p);
-	}
-
-	// wait for start of last cycle
-	while ((TIFR0 & (1 << TOV0)) == 0)
-		;
-
-	// wait for last compare match where OC0B is cleared
-	TIFR0 = (1 << OCF0B);
-	while ((TIFR0 & (1 << OCF0B)) == 0)
-		;
-
-	// stop timer
-	TCCR0B &= ~(1 << CS00);
-	// OC0B shall be zero
-	OCR0B = 0;
-	TCNT0 = 0;
-
-	GlobalInterruptEnable();
-	// wait at least 80us for pixel reset
-	_delay_us(80);
-}
-
-static inline uint8_t minu8(uint8_t a, uint8_t b)
-{
-	return a < b ? a : b;
-}
-
-static inline void setPixel(uint8_t i, uint8_t r, uint8_t g, uint8_t b, uint8_t w)
-{
-	pixel.data[i * BYTES_PER_PIXEL + 0] = g;
-	pixel.data[i * BYTES_PER_PIXEL + 1] = r;
-	pixel.data[i * BYTES_PER_PIXEL + 2] = b;
-#if BYTES_PER_PIXEL > 3
-	pixel.data[i * BYTES_PER_PIXEL + 3] = w;
-#endif
-}
-
-static void setAllPixel(uint8_t r, uint8_t g, uint8_t b)
-{
-	uint8_t w = minu8(minu8(r, g), b);
-	for (uint8_t i = 0; i < NUM_PIXELS; ++i)
-		setPixel(i, r, g, b, w);
-
-}
-
-static void togglePixel(void)
-{
-	if (pixel.on)
-	{
-		pixel.on = false;
-		PIXEL_PWR_PORT |= PIXEL_PWR_BIT;
-	}
-	else
-	{
-		pixel.on = true;
-		PIXEL_PWR_PORT &= ~PIXEL_PWR_BIT;
-
-		bool allOff = true;
-		for (uint8_t i = 0; i < NUM_PIXELS * BYTES_PER_PIXEL; ++i)
-			if (pixel.data[i] > 0) allOff = false;
-
-		if (allOff) setAllPixel(1, 1, 1);
-		writePixels();
-	}
-}
-
-static void setLuminance(uint8_t l)
-{
-	pixel.luminance = l;
-	setAllPixel(l, l, l);
-	writePixels();
-}
-
-static void processCmd(const char *buf)
-{
-	fprintf(&USBSerialStream, "\nprocessing: %s\n", buf);
-	fflush(&USBSerialStream);
-
-	unsigned num, r, g, b, w;
-	if (sscanf(buf, "%u %u %u %u %u", &num, &r, &g, &b, &w) == 5)
-	{
-		setPixel(num, r, g, b, w);
-		writePixels();
-	}
-	else if (sscanf(buf, "a %u %u %u %u", &r, &g, &b, &w) == 4)
-	{
-		for (uint8_t i = 0; i < NUM_PIXELS; ++i)
-			setPixel(i, r, g, b, w);
-		writePixels();
-	}
-	else
-	{
-		fprintf(&USBSerialStream, "invalid command\n");
+		fprintf_P(&USBSerialStream, FSTR("\n\r%u %u %u\n"), r, g, b);
 		fflush(&USBSerialStream);
+		CDC_Device_Flush(&VirtualSerial_CDC_Interface);
+
+		Pixel_SetAll(r, g, b);
+		Pixel_Write();
+	}
+	else
+	{
+		fprintf_P(&USBSerialStream, FSTR("\nexpected; <hue> <sat> <lum>\n"));
 	}
 }
 
@@ -437,38 +386,40 @@ int main(void)
 	SetupHardware();
 
 	/* Create a regular blocking character stream for the interface so that it can be used with the stdio.h functions */
-	CDC_Device_CreateBlockingStream(&VirtualSerial_CDC_Interface, &USBSerialStream);
-	// CDC_Device_CreateStream(&VirtualSerial_CDC_Interface, &USBSerialStream);
+	// CDC_Device_CreateBlockingStream(&VirtualSerial_CDC_Interface, &USBSerialStream);
+	CDC_Device_CreateStream(&VirtualSerial_CDC_Interface, &USBSerialStream);
 
 	GlobalInterruptEnable();
 
-	// printf("hello world\n");
-
-
-	// char linebuf[64];
-	// uint8_t bufpos = 0;
+	char linebuf[64];
+	uint8_t bufpos = 0;
+	enum {
+		NO_PROMPT,
+		HSL_PROMPT,
+	} prompt = NO_PROMPT;
 
 	uint8_t rot = 0;
-	// uint8_t state = 0;
 	bool btn = false;
+	bool powered = false;
+
+	enum {
+		DEFAULT_MODE,
+		ANIM_MODE,
+		ROTATE_MODE,
+	} mode = DEFAULT_MODE;
 
 	for (;;)
 	{
-		// if (rot != RotButton.rotation)
-		// {
-		// 	rot = RotButton.rotation;
-		// 	fprintf(&USBSerialStream, "r: %u\n", rot);
-		// 	fflush(&USBSerialStream);
-		// }
-
-		uint8_t newrot = RotButton.rotation;
-
-		if (rot != newrot)
+		set_sleep_mode(SLEEP_MODE_IDLE);
+        // check updates
+        cli();
+        if (btn == RotButton.pressed && rot == RotButton.rotation)
 		{
-			rot = newrot;
-			fprintf(&USBSerialStream, "s: %#x\n", rot);
-			fflush(&USBSerialStream);
-			setLuminance(RotButton.rotation * 255 / 20);
+            // sleep when no updates
+            sleep_enable();
+            sei();
+            sleep_cpu();
+            sleep_disable();
 		}
 
 		if (btn != RotButton.pressed)
@@ -476,50 +427,94 @@ int main(void)
 			btn = RotButton.pressed;
 			fprintf(&USBSerialStream, "b: %u\n", btn ? 1 : 0);
 			fflush(&USBSerialStream);
-			if (btn == 0) togglePixel();
-		}
-
-		/*// LEDs_TurnOnLEDs(LEDS_LED1);
-		int c = fgetc(&USBSerialStream);
-		// LEDs_TurnOnLEDs(LEDS_LED1);
-
-		led1_on();
-
-		if (c == '\n' || c == '\r')
-		{
-			fputc('\r', &USBSerialStream);
-			fflush(&USBSerialStream);
-			if (bufpos > 0)
+			if (btn == 0) // toggle pixel on button release
 			{
-				linebuf[bufpos] = '\0';
-				processCmd(linebuf);
-				fprintf(&USBSerialStream, "done.\n");
-				fflush(&USBSerialStream);
-				bufpos = 0;
+				powered = !powered;
+				Pixel_SetPower(powered);
 			}
 		}
-		else if (bufpos < sizeof(linebuf) - 1)
+
+		if (powered)
 		{
-			linebuf[bufpos] = c;
-			++bufpos;
+			switch (mode)
+			{
+			case DEFAULT_MODE:
+				rot = updateLuminance(rot);
+				break;
+			case ANIM_MODE:
+				animateLuminance();
+				break;
+			case ROTATE_MODE:
+				rot = rotateLight(rot);
+				break;
+			default:
+				break;
+			}
 		}
 
-		// echo char
-		fputc(c, &USBSerialStream);
-		fflush(&USBSerialStream);
+		int c = fgetc(&USBSerialStream);
+		if (c != EOF)
+		{
+			led1_on();
 
-		led1_off();
+			if (prompt != NO_PROMPT)
+			{
+				if (c == '\n' || c == '\r')
+				{
+					fputc('\r', &USBSerialStream);
+					fputc('\n', &USBSerialStream);
+					fflush(&USBSerialStream);
+					if (bufpos > 0)
+					{
+						linebuf[bufpos] = '\0';
+						switch (prompt)
+						{
+						case HSL_PROMPT: processHSL(linebuf); break;
+						default: break;
+						}
+						fflush(&USBSerialStream);
+						bufpos = 0;
+					}
+					prompt = false;
+				}
+				else if (bufpos < sizeof(linebuf) - 1)
+				{
+					linebuf[bufpos] = c;
+					++bufpos;
+				}
 
-		// if (c != EOF)
-		// {
-		// 	fprintf(&USBSerialStream, "> %#x\n", c);
+				// echo char
+				fputc(c, &USBSerialStream);
+				fflush(&USBSerialStream);
+			}
+			else
+			{
+				switch (c)
+				{
+				case 't':
+					fprintf_P(&USBSerialStream, FSTR("time: %u\n"), GetTime());
+					break;
+				case 'h':
+					fprintf_P(&USBSerialStream, FSTR("hsl> "));
+					prompt = HSL_PROMPT;
+					break;
+				case 'r':
+					mode = mode != ROTATE_MODE ? ROTATE_MODE : DEFAULT_MODE;
+					fprintf_P(&USBSerialStream, FSTR("rotate: %u\n"), mode == ROTATE_MODE);
+					break;
+				case 'a':
+					mode = mode != ANIM_MODE ? ANIM_MODE : DEFAULT_MODE;
+					fprintf_P(&USBSerialStream, FSTR("anim: %u\n"), mode == ANIM_MODE);
+					break;
+				case 'p':
+					powered = !powered;
+					Pixel_SetPower(powered);
+					break;
+				}
+			}
 
-		// }
-		// else
-		// {
-		// 	fputc('.', &USBSerialStream);
-		// 	fflush(&USBSerialStream);
-		// }*/
+			led1_off();
+		}
 
 		CDC_Device_USBTask(&VirtualSerial_CDC_Interface);
 	}
@@ -536,4 +531,3 @@ void EVENT_USB_Device_ControlRequest(void)
 {
 	CDC_Device_ProcessControlRequest(&VirtualSerial_CDC_Interface);
 }
-

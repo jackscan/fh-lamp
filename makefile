@@ -18,8 +18,8 @@ F_CPU        = 16000000
 F_USB        = $(F_CPU)
 OPTIMIZATION = s
 TARGET       = FHLamp
-SRC          = $(TARGET).c Descriptors.c $(LUFA_SRC_USB) $(LUFA_SRC_USBCLASS)
 LUFA_PATH    = $(HOME)/g/lufa/LUFA
+SRC          = $(TARGET).c Descriptors.c Pixel.c Timer.c $(LUFA_SRC_USB) $(LUFA_SRC_USBCLASS)
 CC_FLAGS     = -DUSE_LUFA_CONFIG_HEADER -IConfig/
 LD_FLAGS     =
 
