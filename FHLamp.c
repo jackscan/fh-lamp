@@ -68,7 +68,7 @@
 #define BTN_ISC1 (1 << ISC11)
 #define BTN_INT_vect INT1_vect
 
-#define LUM_STEP 8
+#define LUM_STEP 14
 #define SAT_STEP 8
 #define HUE_STEP 2
 #define MAX_HSL 128
