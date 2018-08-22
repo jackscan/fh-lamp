@@ -591,8 +591,7 @@ static void updateStandby(bool rotated)
 
 		USB_Disable();
 
-		// set_sleep_mode(SLEEP_MODE_IDLE);
-		set_sleep_mode(SLEEP_MODE_STANDBY);
+		set_sleep_mode(SLEEP_MODE_PWR_DOWN);
 		while (checkSleep())
 			;
 
