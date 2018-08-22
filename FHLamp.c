@@ -466,7 +466,7 @@ static uint8_t flickering(uint8_t max)
 	if (dt > interval)
 	{
 		last = t;
-		interval = rnd() / 4 + 16;
+		interval = rnd() / 8 + 16;
 		uint8_t b = rnd() & (MAX_HSL - 1);
 		if (dt + b > (uint16_t)acc)
 			acc = b;
