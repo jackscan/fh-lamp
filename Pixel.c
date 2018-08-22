@@ -172,13 +172,8 @@ void Pixel_SetPower(bool on)
 	{
 		PIXEL_PWR_PORT &= ~PIXEL_PWR_BIT;
 
-		// bool allOff = true;
-		// for (uint8_t i = 0; i < NUM_PIXELS * BYTES_PER_PIXEL; ++i)
-		// 	if (pixel.data[i] > 0) allOff = false;
-
-		// if (allOff) setAllPixel(1, 1, 1);
-
-		// wait 16ms for charging capacitor
+		// wait at least 14ms until capacitor is charged
+		// wait 32ms to be on the save side
 		_delay_ms(32);
 		writePixels();
 	}
