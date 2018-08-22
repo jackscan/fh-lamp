@@ -587,6 +587,7 @@ static void updateStandby(bool rotated)
 
 		LOG("power off");
 		flushlog();
+		State.log_enabled = false;
 
 		USB_Disable();
 
