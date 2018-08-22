@@ -339,10 +339,18 @@ static void updateRGB(uint8_t hue, uint8_t sat, uint8_t lum)
 	}
 }
 
+static void flushlog(void)
+{
+	if (State.log_enabled)
+	{
+		fflush(&USBSerialStream);
+		CDC_Device_Flush(&VirtualSerial_CDC_Interface);
+	}
+}
+
 static void updatePixel(void)
 {
-	fflush(&USBSerialStream);
-	// CDC_Device_Flush(&VirtualSerial_CDC_Interface);
+	flushlog();
 	Pixel_Write();
 }
 
@@ -387,8 +395,7 @@ static void setStandbyMode(void)
 	State.last_mode = State.mode;
 	setMode(STANDBY_MODE, 0, 1, true);
 	Pixel_Clear();
-	fflush(&USBSerialStream);
-	// CDC_Device_Flush(&VirtualSerial_CDC_Interface);
+	flushlog();
 	Pixel_Write();
 }
 
@@ -579,8 +586,7 @@ static void updateStandby(bool rotated)
 		Pixel_SetPower(false);
 
 		LOG("power off");
-		fflush(&USBSerialStream);
-		// CDC_Device_Flush(&VirtualSerial_CDC_Interface);
+		flushlog();
 
 		USB_Disable();
 
@@ -684,7 +690,7 @@ static void handleButton(void)
 	{
 		State.button = newbutton;
 		LOG("b: %u", newbutton ? 1 : 0);
-		fflush(&USBSerialStream);
+		flushlog();
 		click = newbutton == 0; // button release?
 	}
 
@@ -785,7 +791,7 @@ int main(void)
 				{
 					fputc('\r', &USBSerialStream);
 					fputc('\n', &USBSerialStream);
-					fflush(&USBSerialStream);
+					flushlog();
 					if (bufpos > 0)
 					{
 						linebuf[bufpos] = '\0';
@@ -794,7 +800,7 @@ int main(void)
 						case HSL_PROMPT: processHSL(linebuf); break;
 						default: break;
 						}
-						fflush(&USBSerialStream);
+						flushlog();
 						bufpos = 0;
 					}
 					prompt = false;
@@ -807,7 +813,7 @@ int main(void)
 
 				// echo char
 				fputc(c, &USBSerialStream);
-				fflush(&USBSerialStream);
+				flushlog();
 			}
 			else
 			{
