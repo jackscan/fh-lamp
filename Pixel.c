@@ -173,14 +173,14 @@ void Pixel_SetPower(bool on)
 	{
 		PIXEL_PWR_PORT &= ~PIXEL_PWR_BIT;
 
-		bool allOff = true;
-		for (uint8_t i = 0; i < NUM_PIXELS * BYTES_PER_PIXEL; ++i)
-			if (pixel.data[i] > 0) allOff = false;
+		// bool allOff = true;
+		// for (uint8_t i = 0; i < NUM_PIXELS * BYTES_PER_PIXEL; ++i)
+		// 	if (pixel.data[i] > 0) allOff = false;
 
-		if (allOff) setAllPixel(1, 1, 1);
+		// if (allOff) setAllPixel(1, 1, 1);
 
 		// wait 16ms for charging capacitor
-		_delay_ms(16);
+		_delay_ms(32);
 		writePixels();
 	}
 	else
@@ -190,52 +190,15 @@ void Pixel_SetPower(bool on)
 }
 
 
-static uint8_t hue2rgb(uint16_t p, uint16_t q, int16_t t)
-{
-	if (t < 0) t += 255;
-	if (t > 255) t -= 255;
-	if (t < 255 / 6) return p + ((q - p) * 6 * t + 128) / 255;
-	if (t < 255 / 2) return q;
-	if (t < 255 * 2 / 3)
-		return p + ((q - p) * (255 * 2 / 3 - t) * 6 + 128) / 255;
-	return p;
-}
 
-static uint8_t gamma(uint8_t c)
+static uint8_t gammaLookup(uint8_t c)
 {
-    pixel.luminance = c < NUM_LUMINANCE_STEPS ? c : NUM_LUMINANCE_STEPS - 1;
 	return GammaTable[c];
 }
 
-void Pixel_SetHSL(uint8_t hue, uint8_t sat, uint8_t lum)
-{
-	uint8_t r, g, b;
-	if (sat == 0)
-	{
-		r = g = b = gamma(lum); // achromatic
-	}
-	else
-	{
-		uint16_t q = lum < 128 ? (lum * (255 + sat) + 128) / 255
-							   : lum + sat - (lum * sat + 128) / 255;
-		uint16_t p = 2 * lum - q;
-		r          = gamma(hue2rgb(p, q, hue + 255 / 3));
-		g          = gamma(hue2rgb(p, q, hue));
-		b          = gamma(hue2rgb(p, q, hue - 255 / 3));
-	}
 
-    pixel.hue = hue;
-    pixel.saturation = sat;
-    pixel.luminance = lum;
 
-	setAllPixel(r, g, b);
-}
 
-void Pixel_SetLuminance(uint8_t l)
-{
-	Pixel_SetHSL(pixel.hue, pixel.saturation, l);
-	writePixels();
-}
 
 void Pixel_Clear(void)
 {
@@ -244,11 +207,14 @@ void Pixel_Clear(void)
 
 void Pixel_SetAll(uint8_t r, uint8_t g, uint8_t b)
 {
-    setAllPixel(r, g, b);
+    setAllPixel(gammaLookup(r), gammaLookup(g), gammaLookup(b));
 }
 
-void Pixel_Set(uint8_t index, uint8_t r, uint8_t g, uint8_t b)
+void Pixel_Set(int8_t index, uint8_t r, uint8_t g, uint8_t b)
 {
+	while (index < 0) index += NUM_PIXELS;
+	while (index >= NUM_PIXELS) index -= NUM_PIXELS;
+
 #if BYTES_PER_PIXEL > 3
 	uint8_t w = minu8(minu8(r, g), b);
 	r -= w;
@@ -257,7 +223,8 @@ void Pixel_Set(uint8_t index, uint8_t r, uint8_t g, uint8_t b)
 #else
 	uint8_t w = 0;
 #endif
-    setPixel(index, r, g, b, w);
+	setPixel(index, gammaLookup(r), gammaLookup(g), gammaLookup(b),
+			 gammaLookup(w));
 }
 
 void Pixel_Write(void)

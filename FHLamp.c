@@ -68,6 +68,14 @@
 #define BTN_ISC1 (1 << ISC11)
 #define BTN_INT_vect INT1_vect
 
+#define LUM_STEP 8
+#define SAT_STEP 8
+#define HUE_STEP 2
+#define MAX_HSL 128
+
+#define DOUBLE_CLICK_INTERVAL 500
+#define STANDBY_TIME 10000
+
 /** LUFA CDC Class driver interface configuration and state information. This structure is
  *  passed to all CDC Class driver functions, so that multiple instances of the same class
  *  within a device can be differentiated from one another.
@@ -104,11 +112,65 @@ static FILE USBSerialStream;
 
 static struct
 {
-	volatile int8_t rotation;
+	volatile uint8_t rotation;
 	volatile bool pressed;
+
+	/// Upper rotation limit.
+	/// Needs to be <127.
+	uint8_t max;
+	bool clamp;
+
+	// internal:
 	uint8_t rotstate;
 	int8_t dir;
 } RotButton;
+
+enum mode
+{
+	STANDBY_MODE,
+	MENU_MODE,
+	ANIM_MODE,
+	SET_HUE_MODE,
+	SET_SAT_MODE,
+	DEFAULT_MODE,
+};
+
+enum mode MainMenu[] = {
+	SET_HUE_MODE,
+	SET_SAT_MODE,
+	DEFAULT_MODE,
+	ANIM_MODE,
+};
+
+#define MENU_SIZE (sizeof(MainMenu) / sizeof(MainMenu[0]))
+
+static struct
+{
+	/// Current HSL values.
+	/// Max is MAX_HSL (inclusive).
+	uint8_t hue;
+	uint8_t saturation;
+	uint8_t luminance;
+	struct { uint8_t r, g, b; } color;
+
+	/// Last button state.
+	bool button;
+	/// Last rotation.
+	uint8_t rotation;
+
+	enum mode mode;
+	enum mode last_mode;
+	uint16_t anim_time;
+	/// Mode updated.
+	bool update;
+
+	/// Time of last button press.
+	uint16_t last_button;
+
+	bool log_enabled;
+} State = {
+	.mode = DEFAULT_MODE,
+};
 
 ISR(BTN_INT_vect)
 {
@@ -140,11 +202,36 @@ ISR(PCINT0_vect)
 
 	if (rotstate == (ROT1_BIT | ROT2_BIT) && RotButton.dir != 0)
 	{
-		RotButton.rotation += (RotButton.dir > 0 ? 1 : -1);
+		int8_t rot = RotButton.rotation + (RotButton.dir > 0 ? 1 : -1);
+		if (rot > RotButton.max)
+		{
+			rot = RotButton.clamp ? RotButton.max: 0;
+		}
+		else if (rot < 0)
+		{
+			rot = RotButton.clamp ? 0 : RotButton.max;
+		}
+
+		RotButton.rotation = (uint8_t)rot;
 		RotButton.dir = 0;
 	}
 	PORTD &= ~(1 << PD7);
 }
+
+#define LOG(fmt, ...) logmsg(FSTR(fmt), ##__VA_ARGS__)
+
+static void logmsg(const __flash char *fmt, ...)
+{
+	if (State.log_enabled)
+	{
+		va_list args;
+		va_start(args, fmt);
+		vfprintf_P(&USBSerialStream, fmt, args);
+		va_end(args);
+		fputc('\n', &USBSerialStream);
+	}
+}
+
 
 // on Pro Micro board: LEDs are on when port is low
 static inline void led1_on(void)
@@ -215,63 +302,142 @@ static void SetupHardware(void)
 	PRR1 = (1 << PRUSART1);
 }
 
-// static void processCmd(const char *buf)
-// {
-// 	fprintf(&USBSerialStream, "\nprocessing: %s\n", buf);
-// 	fflush(&USBSerialStream);
-
-// 	unsigned num, r, g, b, w;
-// 	if (sscanf(buf, "%u %u %u %u %u", &num, &r, &g, &b, &w) == 5)
-// 	{
-// 		setPixel(num, r, g, b, w);
-// 		writePixels();
-// 	}
-// 	else if (sscanf(buf, "a %u %u %u %u", &r, &g, &b, &w) == 4)
-// 	{
-// 		for (uint8_t i = 0; i < NUM_PIXELS; ++i)
-// 			setPixel(i, r, g, b, w);
-// 		writePixels();
-// 	}
-// 	else
-// 	{
-// 		fprintf(&USBSerialStream, "invalid command\n");
-// 		fflush(&USBSerialStream);
-// 	}
-// }
-
-static uint8_t updateLuminance(uint8_t rot)
+static inline int16_t divRound(int16_t a, int16_t b)
 {
-	const uint8_t step = 25;
-	const uint8_t max = NUM_LUMINANCE_STEPS / step;
-	LOCKI();
-	if (RotButton.rotation >= max) RotButton.rotation = max - 1;
-	else if (RotButton.rotation < 0) RotButton.rotation = 0;
-	uint8_t newrot = RotButton.rotation;
-	UNLOCKI();
-
-	if (rot != newrot)
-	{
-		fprintf(&USBSerialStream, "s: %#x\n", newrot);
-		fflush(&USBSerialStream);
-		CDC_Device_Flush(&VirtualSerial_CDC_Interface);
-		Pixel_SetLuminance(newrot * step);
-	}
-	return newrot;
+	return (a + b / 2) / b;
 }
 
-// static void animateLuminance(void)
-// {
-// 	static const uint8_t l[16] = {
-// 		0, 9, 8, 7, 6, 9, 8, 6, 2, 0, 8, 7, 6, 1, 0, 5,
-// 	};
-// 	uint16_t t = GetTime();
-// 	uint8_t i = t / 128;
-// 	uint8_t r = t % 128;
-// 	uint16_t a = l[i % 16] * 25;
-// 	uint16_t b = l[(i + 1) % 16]*25;
-// 	uint8_t c = (uint8_t)((a * (128 - r) + b * r) / 128);
-// 	Pixel_SetLuminance(c);
-// }
+static uint8_t hue2rgb(int16_t p, int16_t q, int16_t t)
+{
+	if (t < 0) t += MAX_HSL;
+	if (t > MAX_HSL) t -= MAX_HSL;
+	if (t < MAX_HSL / 6)
+		return p + divRound((q - p) * 6 * t, MAX_HSL);
+	if (t < MAX_HSL / 2) return q;
+	if (t < MAX_HSL * 2 / 3)
+		return p + divRound((q - p) * (MAX_HSL * 2 / 3 - t) * 6, MAX_HSL);
+	return p;
+}
+
+static void updateRGB(uint8_t hue, uint8_t sat, uint8_t lum)
+{
+	if (sat == 0)
+	{
+		State.color.r = State.color.g = State.color.b = lum;
+	}
+	else
+	{
+		uint16_t l = lum;
+		uint16_t s = sat;
+		uint16_t q = l < MAX_HSL / 2 ? divRound(l * (MAX_HSL + s), MAX_HSL)
+									 : l + s - divRound(l * s, MAX_HSL);
+		uint16_t p = 2 * l - q;
+
+		State.color.r = hue2rgb(p, q, hue + MAX_HSL / 3);
+		State.color.g = hue2rgb(p, q, hue);
+		State.color.b = hue2rgb(p, q, hue - MAX_HSL / 3);
+	}
+}
+
+static void updatePixel(void)
+{
+	fflush(&USBSerialStream);
+	// CDC_Device_Flush(&VirtualSerial_CDC_Interface);
+	Pixel_Write();
+}
+
+static void setAllPixel(void)
+{
+	Pixel_SetAll(State.color.r, State.color.g, State.color.b);
+	updatePixel();
+}
+
+static void setMode(enum mode mode, uint8_t rot, uint8_t max, bool clamp)
+{
+	LOG("mode: %#x, %u, %u", mode, rot, max);
+	State.mode = mode;
+	State.rotation = rot;
+	State.update = true;
+	LOCKI();
+	RotButton.rotation = State.rotation;
+	RotButton.max = max;
+	RotButton.clamp = clamp;
+	UNLOCKI();
+}
+
+static void setLuminanceMode(enum mode mode)
+{
+	if (State.luminance == 0) State.luminance = LUM_STEP;
+	setMode(mode, State.luminance / LUM_STEP, MAX_HSL / LUM_STEP, true);
+}
+
+static void setHueMode(void)
+{
+	setMode(SET_HUE_MODE, State.hue / HUE_STEP, MAX_HSL / HUE_STEP, false);
+}
+
+static void setSaturationMode(void)
+{
+	setMode(SET_SAT_MODE, State.saturation / SAT_STEP, MAX_HSL / SAT_STEP, true);
+}
+
+static void setStandbyMode(void)
+{
+	State.anim_time = GetTime();
+	State.last_mode = State.mode;
+	setMode(STANDBY_MODE, 0, 1, true);
+	Pixel_Clear();
+	fflush(&USBSerialStream);
+	// CDC_Device_Flush(&VirtualSerial_CDC_Interface);
+	Pixel_Write();
+}
+
+static void updateLuminance(void)
+{
+	State.luminance = (uint8_t)State.rotation * LUM_STEP;
+	LOG("l: %d", State.luminance);
+	updateRGB(State.hue, State.saturation, State.luminance);
+	setAllPixel();
+
+	if (State.luminance == 0)
+		setStandbyMode();
+}
+
+static void updateHue(void)
+{
+	State.hue = (uint8_t)State.rotation * HUE_STEP;
+	// LOG("h: %d", State.hue);
+	updateRGB(State.hue, MAX_HSL, MAX_HSL / 2);
+	Pixel_SetAll(State.color.r, State.color.g, State.color.b);
+
+	// animate luminance of front pixel
+	uint16_t dt = GetTime() - State.anim_time;
+	uint8_t a = MAX_HSL / 2 - ((dt >> 4) & (MAX_HSL / 2 - 1));
+	updateRGB(State.hue, MAX_HSL, a);
+	Pixel_Set(FRONT_PIXEL - 1, State.color.r, State.color.g, State.color.b);
+	Pixel_Set(FRONT_PIXEL + 0, State.color.r, State.color.g, State.color.b);
+	Pixel_Set(FRONT_PIXEL + 1, State.color.r, State.color.g, State.color.b);
+
+	updatePixel();
+}
+
+static void updateSaturation(void)
+{
+	State.saturation = (uint8_t)State.rotation * SAT_STEP;
+	// LOG("s: %d", State.saturation);
+	updateRGB(State.hue, State.saturation, MAX_HSL / 2);
+	Pixel_SetAll(State.color.r, State.color.g, State.color.b);
+
+	// animate luminance of front pixel
+	uint16_t dt = GetTime() - State.anim_time;
+	uint8_t a = MAX_HSL / 2 - ((dt >> 4) & (MAX_HSL / 2 - 1));
+	updateRGB(State.hue, State.saturation, a);
+	Pixel_Set(FRONT_PIXEL - 1, State.color.r, State.color.g, State.color.b);
+	Pixel_Set(FRONT_PIXEL + 0, State.color.r, State.color.g, State.color.b);
+	Pixel_Set(FRONT_PIXEL + 1, State.color.r, State.color.g, State.color.b);
+
+	updatePixel();
+}
 
 static uint8_t rnd(void)
 {
@@ -282,7 +448,7 @@ static uint8_t rnd(void)
 	return s;
 }
 
-static void animateLuminance(void)
+static uint8_t flickering(uint8_t max)
 {
 	static uint16_t last = 0;
 	static uint8_t acc = 0;
@@ -293,52 +459,259 @@ static void animateLuminance(void)
 	if (dt > interval)
 	{
 		last = t;
-		// interval = rnd() / 2 + 16;
-		// uint8_t b = rnd() / 16;
-		// if ((uint16_t)acc + (uint16_t)b < 256)
-		// 	acc += b;
-		// else
-		// 	acc = 255;
 		interval = rnd() / 4 + 16;
-		uint8_t b = rnd();
+		uint8_t b = rnd() & (MAX_HSL - 1);
 		if (dt + b > (uint16_t)acc)
 			acc = b;
 		else
 			acc -= dt;
 		dt = 0;
 	};
-	uint8_t l = acc > dt ? acc - dt : 0;
-	Pixel_SetLuminance(l);
+
+	return (uint8_t)(
+		((uint16_t)(acc > dt ? acc - dt : 0) * (uint16_t)max + MAX_HSL / 2) /
+		(uint16_t)MAX_HSL) | 1;
 }
 
-static uint8_t rotateLight(uint8_t rot)
+static void updateFlickering(void)
 {
-	const uint8_t max = NUM_PIXELS;
-	LOCKI();
-	if (RotButton.rotation >= max) RotButton.rotation = 0;
-	else if (RotButton.rotation < 0) RotButton.rotation = max - 1;
-	uint8_t newrot = RotButton.rotation;
-	UNLOCKI();
+	State.luminance = (uint8_t)State.rotation * LUM_STEP;
+	// LOG("l: %d", State.luminance);
 
-	if (newrot != rot)
-	{
-		rot = newrot;
-		Pixel_Clear();
-		Pixel_Set(newrot, 255, 255, 255);
-		Pixel_Write();
+	uint8_t lum = flickering(State.luminance);
+	updateRGB(State.hue, State.saturation, lum);
+	setAllPixel();
+
+	if (State.luminance == 0)
+		setStandbyMode();
+}
+
+static void updateMenu(bool changed)
+{
+	uint16_t t = GetTime();
+	if (changed) State.anim_time = t;
+
+	uint16_t dt = t - State.anim_time;
+
+	uint8_t h = State.hue;
+	uint8_t s = State.saturation;
+	uint8_t l = State.luminance;
+
+	enum mode entry = MainMenu[State.rotation];
+
+	if (changed) {
+		LOG("menu: %#x", entry);
 	}
-	return newrot;
+
+	switch (entry) {
+	case SET_HUE_MODE:
+		// animate hue
+		h = (dt >> 4) & (MAX_HSL - 1);
+		// set full saturation
+		s = MAX_HSL;
+		// set half luminance for full color
+		l = MAX_HSL / 2;
+		break;
+	case SET_SAT_MODE:
+		// animate saturation
+		s = MAX_HSL - ((dt >> 4) & (MAX_HSL - 1));
+		// set half luminance for full color
+		l = MAX_HSL / 2;
+		break;
+	case DEFAULT_MODE:
+		// animate luminance
+		l = ((dt >> 4) & (MAX_HSL / 2 - 1));
+		if (l < MAX_HSL / 4) l = MAX_HSL / 2 - l;
+		l += MAX_HSL / 4;
+		break;
+	case ANIM_MODE:
+		// animate flickering
+		l = MAX_HSL - (((dt >> 1) & (MAX_HSL - 1)) ^ (MAX_HSL / 4));
+		break;
+	default:
+		// should never happen
+		LOG("illegal menu state: %#x", entry);
+		break;
+	}
+
+	uint8_t index = (NUM_PIXELS * State.rotation + MENU_SIZE / 2) / MENU_SIZE;
+
+	updateRGB(h, s, l);
+
+	if (changed) {
+		LOG("menucolor: (%u %u %u) (%u %u %u)",
+				  h, s, l, State.color.r, State.color.g, State.color.b);
+	}
+
+	Pixel_Clear();
+	Pixel_Set(index - 1, State.color.r, State.color.g, State.color.b);
+	Pixel_Set(index + 0, State.color.r, State.color.g, State.color.b);
+	Pixel_Set(index + 1, State.color.r, State.color.g, State.color.b);
+	updatePixel();
 }
 
-static uint8_t hue2rgb(uint16_t p, uint16_t q, int16_t t)
+static bool checkSleep(void)
 {
-	if (t < 0) t += 255;
-	if (t > 255) t -= 255;
-	if (t < 255 / 6) return p + ((q - p) * 6 * t + 128) / 255;
-	if (t < 255 / 2) return q;
-	if (t < 255 * 2 / 3)
-		return p + ((q - p) * (255 * 2 / 3 - t) * 6 + 128) / 255;
-	return p;
+	cli();
+	bool cond = State.button == RotButton.pressed &&
+		State.rotation == RotButton.rotation;
+	if (cond)
+	{
+		// sleep when no updates
+		sleep_enable();
+		sei();
+		sleep_cpu();
+		sleep_disable();
+	}
+	else
+	{
+		sei();
+	}
+
+	return cond;
+}
+
+static void updateStandby(bool rotated)
+{
+	uint16_t t = GetTime();
+	uint16_t dt = t - State.anim_time;
+	if (!rotated && dt > STANDBY_TIME) {
+		Pixel_SetPower(false);
+
+		LOG("power off");
+		fflush(&USBSerialStream);
+		// CDC_Device_Flush(&VirtualSerial_CDC_Interface);
+
+		USB_Disable();
+
+		// set_sleep_mode(SLEEP_MODE_IDLE);
+		set_sleep_mode(SLEEP_MODE_STANDBY);
+		while (checkSleep())
+			;
+
+		USB_Init();
+
+		rotated = RotButton.rotation != State.rotation;
+		Pixel_SetPower(true);
+
+		LOG("wake up");
+	}
+
+	if (rotated) {
+		State.luminance = LUM_STEP * RotButton.rotation;
+		setLuminanceMode(State.last_mode);
+	}
+}
+
+static void handleMode(void)
+{
+	uint8_t newrot = RotButton.rotation;
+	bool rotated = (newrot != State.rotation);
+	bool changed = rotated || State.update;
+	State.rotation = newrot;
+	State.update = false;
+
+	if (changed)
+		LOG("rot: %u", newrot);
+
+	switch (State.mode)
+	{
+	case STANDBY_MODE:
+		updateStandby(rotated);
+		break;
+	case DEFAULT_MODE:
+		if (changed) updateLuminance();
+		break;
+	case SET_HUE_MODE:
+		updateHue();
+		break;
+	case SET_SAT_MODE:
+		updateSaturation();
+		break;
+	case MENU_MODE:
+		updateMenu(changed);
+		break;
+	case ANIM_MODE:
+		updateFlickering();
+		break;
+	default:
+		break;
+	}
+}
+
+static void menuSelect(void)
+{
+	enum mode entry = MainMenu[State.rotation];
+
+	switch (entry) {
+	case SET_HUE_MODE:
+		setHueMode();
+		break;
+	case SET_SAT_MODE:
+		setSaturationMode();
+		break;
+	case DEFAULT_MODE: // fallthrough
+	case ANIM_MODE:
+		setLuminanceMode(entry);
+		break;
+	default:
+		// should never happen
+		LOG("illegal menu select: %#x", entry);
+		setLuminanceMode(DEFAULT_MODE);
+		break;
+	}
+}
+
+static void enterMenu(void)
+{
+	uint8_t e = 0;
+	// find current mode in MainMenu
+	for (uint8_t i = 0; i < MENU_SIZE; ++i)
+		if (State.mode == MainMenu[i]) {
+			e = i;
+			break;
+		}
+
+	setMode(MENU_MODE, e, MENU_SIZE - 1, false);
+}
+
+static void handleButton(void)
+{
+	bool newbutton = RotButton.pressed;
+	bool click = false;
+
+	if (State.button != newbutton)
+	{
+		State.button = newbutton;
+		LOG("b: %u", newbutton ? 1 : 0);
+		fflush(&USBSerialStream);
+		click = newbutton == 0; // button release?
+	}
+
+	if (!click) return;
+
+	uint16_t t = GetTime();
+	uint16_t dt = t - State.last_button;
+	State.last_button = t;
+
+	if (dt < DOUBLE_CLICK_INTERVAL)
+	{
+		enterMenu();
+	}
+	else
+	{
+		switch (State.mode)
+		{
+		case ANIM_MODE: // fallthrough
+		case DEFAULT_MODE: setStandbyMode(); break;
+		case STANDBY_MODE: setLuminanceMode(State.last_mode); break;
+		case MENU_MODE: menuSelect(); break;
+		default:
+			// get back to main menu
+			enterMenu();
+			break;
+		}
+	}
 }
 
 static void processHSL(const char *buf)
@@ -347,34 +720,16 @@ static void processHSL(const char *buf)
 	if (sscanf(buf, "%u %u %u", &h, &s, &l) == 3 &&
 	    h < 256 && s < 256 && l < 256)
 	{
-		// Pixel_SetHSL(h, s, l);
-		// Pixel_Write();
+		State.hue = h;
+		State.saturation = s;
+		State.luminance = l;
 
-		uint8_t r, g, b;
-		if (s == 0)
-		{
-			r = g = b = l; // achromatic
-		}
-		else
-		{
-			uint16_t q = l < 128 ? (l * (255 + s) + 128) / 255
-								: l + s - (l * s + 128) / 255;
-			uint16_t p = 2 * l - q;
-			r          = (hue2rgb(p, q, h + 255 / 3));
-			g          = (hue2rgb(p, q, h));
-			b          = (hue2rgb(p, q, h - 255 / 3));
-		}
-
-		fprintf_P(&USBSerialStream, FSTR("\n\r%u %u %u\n"), r, g, b);
-		fflush(&USBSerialStream);
-		CDC_Device_Flush(&VirtualSerial_CDC_Interface);
-
-		Pixel_SetAll(r, g, b);
-		Pixel_Write();
+		updateRGB(State.hue, State.saturation, State.luminance);
+		setAllPixel();
 	}
 	else
 	{
-		fprintf_P(&USBSerialStream, FSTR("\nexpected; <hue> <sat> <lum>\n"));
+		LOG("\nexpected; <hue> <sat> <lum>");
 	}
 }
 
@@ -391,6 +746,8 @@ int main(void)
 
 	GlobalInterruptEnable();
 
+	led2_on();
+
 	char linebuf[64];
 	uint8_t bufpos = 0;
 	enum {
@@ -398,64 +755,29 @@ int main(void)
 		HSL_PROMPT,
 	} prompt = NO_PROMPT;
 
-	uint8_t rot = 0;
-	bool btn = false;
-	bool powered = false;
+	Pixel_SetPower(true);
+	setStandbyMode();
 
-	enum {
-		DEFAULT_MODE,
-		ANIM_MODE,
-		ROTATE_MODE,
-	} mode = DEFAULT_MODE;
+
+
+	// if ( == NEW_LUFA_SIGNATURE) {
+	// 	_updatedLUFAbootloader = true;
+	// }
+
+	led2_off();
 
 	for (;;)
 	{
 		set_sleep_mode(SLEEP_MODE_IDLE);
-        // check updates
-        cli();
-        if (btn == RotButton.pressed && rot == RotButton.rotation)
-		{
-            // sleep when no updates
-            sleep_enable();
-            sei();
-            sleep_cpu();
-            sleep_disable();
-		}
+		checkSleep();
 
-		if (btn != RotButton.pressed)
-		{
-			btn = RotButton.pressed;
-			fprintf(&USBSerialStream, "b: %u\n", btn ? 1 : 0);
-			fflush(&USBSerialStream);
-			if (btn == 0) // toggle pixel on button release
-			{
-				powered = !powered;
-				Pixel_SetPower(powered);
-			}
-		}
-
-		if (powered)
-		{
-			switch (mode)
-			{
-			case DEFAULT_MODE:
-				rot = updateLuminance(rot);
-				break;
-			case ANIM_MODE:
-				animateLuminance();
-				break;
-			case ROTATE_MODE:
-				rot = rotateLight(rot);
-				break;
-			default:
-				break;
-			}
-		}
+		handleButton();
+		handleMode();
 
 		int c = fgetc(&USBSerialStream);
 		if (c != EOF)
 		{
-			led1_on();
+			// led1_on();
 
 			if (prompt != NO_PROMPT)
 			{
@@ -492,28 +814,37 @@ int main(void)
 				switch (c)
 				{
 				case 't':
-					fprintf_P(&USBSerialStream, FSTR("time: %u\n"), GetTime());
+					LOG("time: %u", GetTime());
 					break;
-				case 'h':
-					fprintf_P(&USBSerialStream, FSTR("hsl> "));
+				case 'i':
+					LOG("hsl> ");
 					prompt = HSL_PROMPT;
 					break;
-				case 'r':
-					mode = mode != ROTATE_MODE ? ROTATE_MODE : DEFAULT_MODE;
-					fprintf_P(&USBSerialStream, FSTR("rotate: %u\n"), mode == ROTATE_MODE);
+				case 'd':
+					LOG("hsl: (%u %u %u) (%u %u %u)", State.hue,
+						State.saturation, State.luminance, State.color.r,
+						State.color.g, State.color.b);
+					break;
+				case 'l':
+					setLuminanceMode(DEFAULT_MODE);
+					break;
+				case 'h':
+					setHueMode();
+					break;
+				case 's':
+					setSaturationMode();
 					break;
 				case 'a':
-					mode = mode != ANIM_MODE ? ANIM_MODE : DEFAULT_MODE;
-					fprintf_P(&USBSerialStream, FSTR("anim: %u\n"), mode == ANIM_MODE);
+					setLuminanceMode(ANIM_MODE);
 					break;
 				case 'p':
-					powered = !powered;
-					Pixel_SetPower(powered);
+					if (State.mode == STANDBY_MODE) setLuminanceMode(State.last_mode);
+					else setStandbyMode();
 					break;
 				}
 			}
 
-			led1_off();
+			// led1_off();
 		}
 
 		CDC_Device_USBTask(&VirtualSerial_CDC_Interface);
@@ -530,4 +861,49 @@ void EVENT_USB_Device_ConfigurationChanged(void)
 void EVENT_USB_Device_ControlRequest(void)
 {
 	CDC_Device_ProcessControlRequest(&VirtualSerial_CDC_Interface);
+}
+
+static inline void checkSerial(USB_ClassInfo_CDC_Device_t *const CDCInterfaceInfo)
+{
+	State.log_enabled =
+		(CDCInterfaceInfo->State.ControlLineStates.HostToDevice &
+		 CDC_CONTROL_LINE_OUT_DTR) != 0 &&
+		CDCInterfaceInfo->State.LineEncoding.BaudRateBPS > 1200;
+}
+
+static bool bps1200active = false;
+
+void EVENT_CDC_Device_ControLineStateChanged(
+	USB_ClassInfo_CDC_Device_t *const CDCInterfaceInfo)
+{
+	checkSerial(CDCInterfaceInfo);
+
+
+	uint16_t *const pmagic = (uint16_t *)0x0800;
+	if (bps1200active &&
+		(CDCInterfaceInfo->State.ControlLineStates.HostToDevice &
+		 CDC_CONTROL_LINE_OUT_DTR) == 0)
+	{
+		led1_on();
+		*pmagic = 0x7777;
+		wdt_enable(WDTO_120MS);
+	}
+	else
+	{
+		led1_off();
+		wdt_disable();
+		wdt_reset();
+		*pmagic = 0;
+	}
+}
+
+void EVENT_CDC_Device_LineEncodingChanged(
+	USB_ClassInfo_CDC_Device_t *const CDCInterfaceInfo)
+{
+	checkSerial(CDCInterfaceInfo);
+
+	bps1200active = (CDCInterfaceInfo->State.ControlLineStates.HostToDevice &
+					 CDC_CONTROL_LINE_OUT_DTR) != 0 &&
+					CDCInterfaceInfo->State.LineEncoding.BaudRateBPS == 1200;
+
 }

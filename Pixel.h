@@ -5,14 +5,12 @@
 #include <stdint.h>
 
 #define NUM_PIXELS 12
-#define NUM_LUMINANCE_STEPS 256
+#define FRONT_PIXEL 9
 
 void Pixel_Setup(void);
 void Pixel_SetPower(bool);
-void Pixel_SetLuminance(uint8_t);
-void Pixel_SetHSL(uint8_t hue, uint8_t sat, uint8_t lum);
 void Pixel_Clear(void);
-void Pixel_Set(uint8_t index, uint8_t r, uint8_t g, uint8_t b);
+void Pixel_Set(int8_t index, uint8_t r, uint8_t g, uint8_t b);
 void Pixel_SetAll(uint8_t r, uint8_t g, uint8_t b);
 void Pixel_Write(void);
 

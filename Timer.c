@@ -23,5 +23,8 @@ void StartTimer(void)
 
 uint16_t GetTime(void)
 {
-    return time;
+    LOCKI();
+    uint16_t t = time;
+    UNLOCKI();
+    return t;
 }
